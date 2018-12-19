@@ -1,0 +1,292 @@
+---
+title: "Zillow House Price Prediction"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import the data and add house age as a new feature. 
+```{r, echo=TRUE}
+data <- read.csv("~/Desktop/zillow/data.csv")
+data$TransDate <- as.Date(data$TransDate,'%m/%d/%Y')
+data$TransYear <- as.numeric(format(data$TransDate, '%Y'))
+data$HouseAge <- data$TransYear - as.numeric(data$BuiltYear)
+#summary(data)
+```
+
+After inspecting the data, there are missing values in columns including GarageSquareFeet, ViewType, BGMedHomeValue, BGMedRent, and BGMedYearBuilt. Among those featres, Among all the features, the precentages of the missing observations are not high except the feature "ViewType", which has more than 77% missing values. In order to make more accurate predictions, the first step is to impute the missing values. The model I use for imputing the missing values is "missForest" which is a non-parametric method. In addition, I assume the GarageSquareFeet is correlated with the BedroomCnt, BathroomCnt, FinishedSquareFeet, LotSizeSquareFeet, and StoryCnt. And other "BGMed-" related features depend on the Longtitude, Latitude, and other "BGMed-" related features. Therefore, the missing values are imputed using the following codes. The missing values for the feature "ViewType" are not imputed. Below are the R codes:    
+
+```{r pressure, echo=TRUE}
+### Impute missing values for GarageSquareFeet
+library(missForest)
+X_size <- data[, c(7:12)]
+X_sizeImp <- missForest(X_size)$ximp
+X_sizeImp <- as.matrix(X_sizeImp)
+X_sizeImp <- scale(X_sizeImp)
+### Impute missing values for "BGMed-" realted features
+X_block <- data[, 15:24]  
+X_blockImp <- missForest(X_block)$ximp
+X_blockImp <- as.matrix(X_blockImp)
+X_blockImp <- scale(X_blockImp)
+```
+
+After imputing the missing values, the dataset is randomly separated into the training set and the validation set with the ratio of 80%:20%. 
+
+```{r pressure, echo=TRUE}
+set.seed(23)
+rand <- sample(1:nrow(data), nrow(data)/5)
+train_set <- data[-rand, ]
+valid_set <- data[rand, ]
+```
+
+Three candicate models are considered for this particular dataset including polynomial linear regression with interaction terms, gradient boosting model, and the xgboost model. For the polynomial linear regression model, the step function is used for the feature selection. On the other hand, hyper-parameters are chosen respectively for the gradient boosing model and the xgboost model by valuating the performance on the validation set. Note that, the dependent variable is transformed by "log"" function since such transformation improves the prediction in practice. 
+
+
+Linear Regression Model: Polynomial terms and interpretable interaction terms are added into the model. Then step function is used to eliminate the extra terms in order to keep the parsimony of the model based on the criteria of AIC. 
+
+
+```{r pressure, echo=TRUE}
+# Data manipulation on both training set and validation set
+Y_train = train_set$SaleDollarCnt
+Y_valid = valid_set$SaleDollarCnt
+X_size_train = X_sizeImp[-rand,]
+X_block_train = X_blockImp[-rand, ]
+X_size_valid = X_sizeImp[rand, ]
+X_block_valid = X_blockImp[rand, ]
+var_name <- paste0('V', 1:17)
+X_lm_train <- cbind(X_size_train, X_block_train, train_set$HouseAge)
+colnames(X_lm_train) <- var_name
+X_lm_valid <- cbind(X_size_valid, X_block_valid, valid_set$HouseAge)
+lm_train_data <- data.frame(cbind(Y_train, X_lm_train))
+lm_valid_data <- data.frame(cbind(Y_valid, X_lm_valid))
+colnames(lm_train_data) <- c("Y", var_name)
+colnames(lm_valid_data) <- colnames(lm_train_data)
+
+
+# Initial polynomial regression model
+m_initial <- lm(log(Y) ~ (V1 +V2 + V3 + V4 + V5 + V6)^2 + (V7 + V8)^3 + (V9+ V10+ V11+ V12+ V13 +  V14+ V15+ V16)^2 + V17, data =lm_train_data )
+# The parsimonious regreesion model
+m_final <- step(m_initial)
+# Prediction on the training set and validation set
+lm_pred <- exp(m_final$fitted.values)
+lm_valid_data <- data.frame(X_lm_valid)
+lm_valid_pred <- exp(predict(m_final, newdata =lm_valid_data))
+```
+
+Gradient Boosting Model: Two hyper-parameters: n.trees, and interaction.depth are selected based on the performance on the validation test.  
+
+
+```{r pressure, echo=TRUE}
+# Data manipulation on both training set and validation set
+library(gbm) 
+tree <- seq(300, 800, 100)
+interaction_depth <- seq(1,6,1)
+train_error <- matrix(0, nrow = length(tree), ncol = length(interaction_depth))
+valid_error <- matrix(0, nrow = length(tree), ncol = length(interaction_depth))
+X_train <- cbind(X_size_train, X_block_train, train_set$HouseAge)
+X_valid <- cbind(X_size_valid, X_block_valid, valid_set$HouseAge)
+data_comb <- data.frame(cbind(log(Y_train), X_size_train, X_block_train, train_set$HouseAge)) 
+colnames(data_comb)[18] <- "HouseAge"
+data_comb_valid <- data.frame(cbind(log(Y_valid), X_size_valid, X_block_valid, valid_set$HouseAge)) 
+colnames(data_comb_valid)[18] <- "HouseAge"
+
+## Test hyper-parameters on the validation set
+for(i in 1:length(tree)){
+  for(j in 1:length(interaction_depth)){
+    para_tree = tree[i]
+    para_inter = interaction_depth[j]
+    gbmFit <- gbm(log(V1) ~ .  , data = data_comb, distribution = "gaussian", n.trees = para_tree, shrinkage = 0.02, interaction.depth = para_inter)
+    pred_train <- exp(predict(gbmFit, n.trees = para_tree, data_comb[,2:18]))
+    pred_valid <- exp(predict(gbmFit, n.trees = para_tree, data_comb_valid[,2:18] ))
+    #train_error[i,j] = mean((pred_train - Y_train)^2)
+    valid_error[i,j] = mean(abs(exp(pred_valid) - Y_valid)/Y_valid)
+  }
+}
+# Find the hyper-parameters for the smallest error for the training set
+which(valid_error == min(valid_error), arr.ind = TRUE)
+i = 6
+j = 6
+# Prediction for the training set and validation set
+bmFit <- gbm(log(V1) ~ .  , data = data_comb, distribution = "gaussian",n.trees = tree[i], shrinkage = 0.02, interaction.depth = interaction_depth[j])
+gbm_pred<- exp(predict(gbmFit, n.trees = tree[i], data_comb[,2:18]))
+gbm_valid_pred <- exp(predict(gbmFit, n.trees = tree[i], data_comb_valid ))
+```
+
+
+XGboost: Two hyper-parameters: max_depth and gamma are selected based on the performance on the validation data performance. 
+
+```{r pressure, echo=TRUE}
+# Data manipulation on both training set and validation set
+library(xgboost)
+max_depth <- seq(2, 10 ,1)
+gamma <- seq(0.04, 0.1, 0.01)
+valid_error <- matrix(0, nrow = length(max_depth), ncol = length(gamma))
+X_train <- as.matrix(cbind(X_size_train, X_block_train, train_set$HouseAge))
+colnames(X_train)[17] = "HouseAge"
+X_valid <- as.matrix(cbind(X_size_valid, X_block_valid, valid_set$HouseAge))
+colnames(X_valid)[17] = "HouseAge"
+## Test hyper-parameters on the validation set
+
+for(i in 1:length(max_depth)){
+  for(j in 1:length(gamma)){
+     xgbFit = xgboost(data = X_train, nfold = 5, label = as.matrix(log(Y_train)), 
+                 nrounds = 2200, verbose = FALSE, objective = "reg:linear", eval_metric = "rmse", nthread = 8, eta = 0.01, gamma = gamma[j], max_depth = max_depth[i], min_child_weight = 1.7817, subsample = 0.5213, colsample_bytree = 0.4603)
+    pred_train <- exp(predict(xgbFit, X_train))
+    pred_valid <- exp(predict(xgbFit, X_valid))
+    #train_error[i,j] = mean((pred_train - Y_train)^2)
+    valid_error[i,j] = mean(abs(exp(pred_valid) - Y_valid)/Y_valid)
+  }
+}
+which(valid_error == min(valid_error), arr.ind = TRUE)
+
+# Find the hyper-parameters for the smallest error for the training set
+i= 8
+j= 6 
+# Prediction for the training set and validation set
+xgbFit = xgboost(data = X_train, nfold = 5, label = as.matrix(log(Y_train)), 
+                 nrounds = 2200, verbose = FALSE, objective = "reg:linear", eval_metric = "rmse", nthread = 8, eta = 0.01, gamma = gamma[j], max_depth = max_depth[i], min_child_weight = 1.7817, subsample = 0.5213, colsample_bytree = 0.4603)
+xg_pred <- exp(predict(xgbFit, X_train))
+xg_valid_pred <- exp(predict(xgbFit, X_valid))
+```
+
+
+After having the fitted values from three different model, the linear regression is used to determine the weights for each model. In other words, the final prediction is the linear combination of the three predictions. 
+```{r pressure, echo=TRUE}
+m_bag <- lm(log(Y_train) ~ log(lm_pred) + log(gbm_pred) + log(xg_pred)-1 )
+summary(m_bag)
+```
+
+Performances on the training set and validation set, for training set both AAPE and MAPE: roughly 10%. For validation set, both AAPE and MAPE achieves approximate 10%.  
+
+ 
+
+```{r pressure, echo=TRUE}
+m_bag <- lm(log(Y_train) ~ log(lm_pred) + log(gbm_pred) + log(xg_pred)-1 )
+m_bag
+mean(abs(exp(m_bag$fitted.values) - Y_train)/Y_train)
+median(abs(exp(m_bag$fitted.values) - Y_train)/Y_train)
+```
+
+```{r pressure, echo=TRUE}
+m_bag <- lm(log(Y_train) ~ log(lm_pred) + log(gbm_pred) + log(xg_pred)-1 )
+m_bag$coefficients
+X_valid_predict <- data.frame(cbind(lm_valid_pred , gbm_valid_pred, xg_valid_pred ))
+pred_valid <- exp( m_bag$coefficients[1] * log(lm_valid_pred) + m_bag$coefficients[2] * log(gbm_valid_pred) + m_bag$coefficients[3] * log(xg_valid_pred))
+mean(abs(pred_valid - Y_valid)/Y_valid)
+median(abs(pred_valid - Y_valid)/Y_valid)
+```
+
+Above are the analysis primary on the training set. Below is the prediction procedure on the test dataset. 
+Based on the above results, we can see we did not overfit the data, therefore all training observations are used to do the prediction on the test dataset using the above bagging algorithm. 
+
+First step is to impute all the missing values for both training set and testing set. 
+```{r pressure, echo=TRUE}
+#Data manipulation for both training set and testing set (missing values imputation). 
+
+train <- read.csv("~/Desktop/zillow/data.csv")
+test <- read.csv("~/Desktop/zillow/test.csv")
+data <- rbind(train, test)
+data$TransDate <- as.Date(data$TransDate,'%m/%d/%Y')
+data$TransYear <- as.numeric(format(data$TransDate, '%Y'))
+data$Month <- as.numeric(format(data$TransDate, '%M'))
+data$HouseAge <- data$TransYear - as.numeric(data$BuiltYear)
+
+X_size <- data[, c(7:12)]
+X_sizeImp <- missForest(X_size)$ximp
+X_sizeImp <- as.matrix(X_sizeImp)
+X_sizeImp <- scale(X_sizeImp)
+
+X_block <- data[, 15:24]  
+X_blockImp <- missForest(X_block)$ximp
+X_blockImp <- as.matrix(X_blockImp)
+X_blockImp <- scale(X_blockImp)
+```
+
+Polynomial linear regression model: 
+```{r pressure, echo=TRUE}
+# Linear regression model and prediction on the training set and testing set
+Y_train = data[1:nrow(train),2]
+
+X_size_train = X_sizeImp[1:nrow(train),]
+X_block_train = X_blockImp[1:nrow(train), ]
+X_size_test = X_sizeImp[(nrow(train)+1):nrow(data), ]
+X_block_test = X_blockImp[(nrow(train)+1):nrow(data), ]
+var_name <- paste0('V', 1:17)
+
+X_lm_train <- cbind(X_size_train, X_block_train, data$HouseAge[1:nrow(train)] )
+colnames(X_lm_train) <- var_name
+X_lm_test <- cbind(X_size_test, X_block_test, data$HouseAge[(nrow(train)+1):nrow(data)])
+
+lm_train_data <- data.frame(cbind(Y_train, X_lm_train))
+colnames(lm_train_data) <- c("Y", var_name)
+m_initial <- lm(log(Y) ~ (V2 + V3 + V4 + V5 + V6)^2 + (V7 + V8)^3 + (V9+ V10+ V11+ V12+ V13 +  V14+ V15+ V16)^2 + V17, data =lm_train_data )
+m_final <- step(m_initial)
+#summary(m_final)
+lm_pred <- exp(m_final$fitted.values)
+lm_test_data <- data.frame(X_lm_test)
+colnames(lm_test_data) <- c(var_name)
+lm_test_pred <- exp(predict(m_final, newdata =lm_test_data))
+```
+
+Gradient Boosting Model:
+```{r pressure, echo=TRUE}
+tree <- seq(300, 800, 100)
+interaction_depth <- seq(1,6,1)
+
+X_train <- cbind(X_size_train, X_block_train, data$HouseAge[1:nrow(train)] )
+X_test <- cbind(X_size_test, X_block_test, data$HouseAge[(nrow(train)+1):nrow(data)])
+
+data_comb <- data.frame(cbind(log(Y_train), X_size_train, X_block_train, data$HouseAge[1:nrow(train)] ))
+
+data_comb_test <- data.frame(cbind(X_size_test, X_block_test, data$HouseAge[(nrow(train)+1):nrow(data)]))
+colnames(data_comb_test)[17] <- colnames(data_comb)[18]
+# smallest
+i = 6
+j = 6
+gbmFit <- gbm(log(V1) ~ .  , data = data_comb, distribution = "gaussian",n.trees = tree[i], shrinkage = 0.02, interaction.depth = interaction_depth[j])
+gbm_pred<- exp(predict(gbmFit, n.trees = tree[i], data_comb[,2:18]))
+gbm_test_pred <- exp(predict(gbmFit, n.trees = tree[i], data_comb_test ))
+```
+
+
+XGBoost Model: 
+```{r pressure, echo=TRUE}
+max_depth <- seq(2, 10 ,1)
+gamma <- seq(0.04, 0.1, 0.01)
+
+X_train <- as.matrix(cbind(X_size_train, X_block_train, data$HouseAge[1:nrow(train)]))
+colnames(X_train)[17] = "HouseAge"
+X_test <- as.matrix(cbind(X_size_test, X_block_test, data$HouseAge[(nrow(train)+1):nrow(data)]))
+colnames(X_test)[17] = "HouseAge"
+i=8
+j=6 
+ xgbFit = xgboost(data = X_train, nfold = 5, label = as.matrix(log(Y_train)), 
+                 nrounds = 2200, verbose = FALSE, objective = "reg:linear", eval_metric = "rmse", nthread = 8, eta = 0.01, gamma = gamma[j], max_depth = max_depth[i], min_child_weight = 1.7817, subsample = 0.5213, colsample_bytree = 0.4603)
+xg_pred <- exp(predict(xgbFit, X_train))
+xg_test_pred <- exp(predict(xgbFit, X_test))
+```
+
+Bag results and performance on the training set AAPE: 9.70% MAPE: 7.52% : 
+
+```{r pressure, echo=TRUE}
+#m_bag <- lm(Y_train ~ lm_pred + gbm_pred + xg_pred)
+m_bag <- lm(log(Y_train) ~ log(lm_pred) + log(gbm_pred) + log(xg_pred)-1 )
+X_valid_predict <- data.frame(cbind(lm_valid_pred , gbm_valid_pred, xg_valid_pred ))
+m_bag
+pred_test <- exp(  m_bag$coefficients[1]  * log(lm_test_pred) + m_bag$coefficients[2] * log(gbm_test_pred) + m_bag$coefficients[3]* log(xg_test_pred))
+
+mean(abs(Y_train - exp(m_bag$fitted.values))/Y_train)
+median(abs(exp(m_bag$fitted.values) - Y_train)/Y_train)
+
+setwd("/Users/kevin/Desktop/zillow")
+res <- cbind(test$PropertyID, pred_test)
+res <- data.frame(res)
+colnames(res) <- c("PropertyID", "SaleDollarCnt")
+write.csv(res, file="ZillowResult.csv", row.names=FALSE)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
